@@ -63,6 +63,7 @@ const serverListenerBootTimeout = 5 * time.Second
 func NewServer(db *gorm.DB, cs carstore.CarStore, serkey *did.PrivKey, handleSuffix, serviceUrl string, didr plc.PLCClient, jwtkey []byte) (*Server, error) {
 	db.AutoMigrate(&User{})
 	db.AutoMigrate(&Peering{})
+	db.AutoMigrate(&PasswordReset{})
 
 	evtman := events.NewEventManager(events.NewMemPersister())
 
@@ -371,6 +372,10 @@ func (s *Server) HandleResolveDid(c echo.Context) error {
 }
 
 type User = pdsdata.User
+
+// PasswordReset maps to pdsdata.PasswordReset; keeping an alias makes
+// handler signatures concise without additional imports.
+type PasswordReset = pdsdata.PasswordReset
 
 type RefreshToken struct {
 	gorm.Model

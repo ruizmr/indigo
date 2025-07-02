@@ -3,9 +3,15 @@ package pds
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base32"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"strings"
+	"time"
 
 	comatprototypes "github.com/bluesky-social/indigo/api/atproto"
 	lexutil "github.com/bluesky-social/indigo/lex/util"
@@ -116,11 +122,82 @@ func (s *Server) handleComAtprotoServerDeleteAccount(ctx context.Context, body *
 }
 
 func (s *Server) handleComAtprotoServerRequestPasswordReset(ctx context.Context, body *comatprototypes.ServerRequestPasswordReset_Input) error {
-	panic("not yet implemented")
+	if err := validateEmail(body.Email); err != nil {
+		return err
+	}
+
+	// Locate user by email
+	var u User
+	if err := s.db.First(&u, "LOWER(email) = LOWER(?)", body.Email).Error; err != nil {
+		return fmt.Errorf("no account with that email")
+	}
+
+	// Generate fresh token
+	token, err := generateResetToken()
+	if err != nil {
+		return err
+	}
+
+	// Persist hashed token so that the plaintext never hits disk
+	hash := sha256.Sum256([]byte(token))
+	pr := PasswordReset{
+		UserID:    u.ID,
+		TokenHash: hex.EncodeToString(hash[:]),
+		ExpiresAt: time.Now().Add(1 * time.Hour), // 1-hour window
+		Used:      false,
+	}
+	if err := s.db.Create(&pr).Error; err != nil {
+		return err
+	}
+
+	// MVP: log the token so that developers can copy/paste it during testing.
+	// In production this should be sent via SMTP / transactional email service.
+	s.log.Info("password reset token generated", "user", u.Handle, "email", u.Email, "token", token)
+
+	return nil
 }
 
 func (s *Server) handleComAtprotoServerResetPassword(ctx context.Context, body *comatprototypes.ServerResetPassword_Input) error {
-	panic("not yet implemented")
+	// Basic password quality check (MVP)
+	if len(body.Password) < 8 {
+		return fmt.Errorf("password must be at least 8 characters long")
+	}
+
+	token := strings.ToUpper(strings.TrimSpace(body.Token))
+	if token == "" {
+		return fmt.Errorf("token is required")
+	}
+
+	// Hash the provided token and look it up
+	hash := sha256.Sum256([]byte(token))
+	hashStr := hex.EncodeToString(hash[:])
+
+	var pr PasswordReset
+	if err := s.db.First(&pr, "token_hash = ? AND used = ?", hashStr, false).Error; err != nil {
+		return fmt.Errorf("invalid or expired token")
+	}
+	if pr.ExpiresAt.Before(time.Now()) {
+		return fmt.Errorf("token has expired")
+	}
+
+	// Load associated user
+	var u User
+	if err := s.db.First(&u, "id = ?", pr.UserID).Error; err != nil {
+		return err
+	}
+
+	// Update the user's password
+	u.Password = body.Password
+	if err := s.db.Save(&u).Error; err != nil {
+		return err
+	}
+
+	// Mark token as used to prevent replay
+	pr.Used = true
+	_ = s.db.Save(&pr)
+
+	// Successful reset returns 200 with empty body per spec
+	return nil
 }
 
 func (s *Server) handleComAtprotoRepoUploadBlob(ctx context.Context, r io.Reader, contentType string) (*comatprototypes.RepoUploadBlob_Output, error) {
@@ -478,4 +555,25 @@ func (s *Server) handleComAtprotoServerUpdateEmail(ctx context.Context, body *co
 }
 func (s *Server) handleComAtprotoTempFetchLabels(ctx context.Context, limit int, since *int) (*comatprototypes.TempFetchLabels_Output, error) {
 	panic("nyi")
+}
+
+// -------------------- helpers --------------------
+
+// generateResetToken creates a 10-character base32 token (A-Z2-7) formatted as
+// XXXXX-XXXXX. The function guarantees a cryptographically secure random
+// source and returns the formatted token ready for display.
+func generateResetToken() (string, error) {
+	// 50 bits of entropy → 10 base32 chars (each 5 bits)
+	raw := make([]byte, 7) // 56 bits, will be trimmed
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	enc := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw)
+	enc = strings.ToUpper(enc)
+	if len(enc) < 10 {
+		// Should not happen but guard anyway
+		return "", fmt.Errorf("unexpected short encoding")
+	}
+	token := enc[:10]
+	return token[:5] + "-" + token[5:], nil
 }
